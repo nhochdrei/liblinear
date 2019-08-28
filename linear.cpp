@@ -31,6 +31,7 @@ static void print_string_stdout(const char *s)
 static void print_null(const char *s) {}
 
 static void (*liblinear_print_string) (const char *) = &print_string_stdout;
+static int (*liblinear_random_func) (void) = &rand;
 
 #if 1
 static void info(const char *fmt,...)
@@ -625,7 +626,7 @@ void Solver_MCSVM_CS::Solve(double *w)
 		double stopping = -INF;
 		for(i=0;i<active_size;i++)
 		{
-			int j = i+rand()%(active_size-i);
+			int j = i+liblinear_random_func()%(active_size-i);
 			swap(index[i], index[j]);
 		}
 		for(s=0;s<active_size;s++)
@@ -883,7 +884,7 @@ static void solve_l2r_l1l2_svc(
 
 		for (i=0; i<active_size; i++)
 		{
-			int j = i+rand()%(active_size-i);
+			int j = i+liblinear_random_func()%(active_size-i);
 			swap(index[i], index[j]);
 		}
 
@@ -1074,7 +1075,7 @@ static void solve_l2r_l1l2_svr(
 
 		for(i=0; i<active_size; i++)
 		{
-			int j = i+rand()%(active_size-i);
+			int j = i+liblinear_random_func()%(active_size-i);
 			swap(index[i], index[j]);
 		}
 
@@ -1275,7 +1276,7 @@ void solve_l2r_lr_dual(const problem *prob, double *w, double eps, double Cp, do
 	{
 		for (i=0; i<l; i++)
 		{
-			int j = i+rand()%(l-i);
+			int j = i+liblinear_random_func()%(l-i);
 			swap(index[i], index[j]);
 		}
 		int newton_iter = 0;
@@ -1446,7 +1447,7 @@ static void solve_l1r_l2_svc(
 
 		for(j=0; j<active_size; j++)
 		{
-			int i = j+rand()%(active_size-j);
+			int i = j+liblinear_random_func()%(active_size-j);
 			swap(index[i], index[j]);
 		}
 
@@ -1813,7 +1814,7 @@ static void solve_l1r_lr(
 
 			for(j=0; j<QP_active_size; j++)
 			{
-				int i = j+rand()%(QP_active_size-j);
+				int i = j+liblinear_random_func()%(QP_active_size-j);
 				swap(index[i], index[j]);
 			}
 
@@ -2612,7 +2613,7 @@ void cross_validation(const problem *prob, const parameter *param, int nr_fold, 
 	for(i=0;i<l;i++) perm[i]=i;
 	for(i=0;i<l;i++)
 	{
-		int j = i+rand()%(l-i);
+		int j = i+liblinear_random_func()%(l-i);
 		swap(perm[i],perm[j]);
 	}
 	for(i=0;i<=nr_fold;i++)
@@ -2675,7 +2676,7 @@ void find_parameters(const problem *prob, const parameter *param, int nr_fold, d
 	for(i=0;i<l;i++) perm[i]=i;
 	for(i=0;i<l;i++)
 	{
-		int j = i+rand()%(l-i);
+		int j = i+liblinear_random_func()%(l-i);
 		swap(perm[i],perm[j]);
 	}
 	for(i=0;i<=nr_fold;i++)
@@ -3201,3 +3202,10 @@ void set_print_string_function(void (*print_func)(const char*))
 		liblinear_print_string = print_func;
 }
 
+void set_random_function(int (*random_func)(void))
+{
+    if (random_func == NULL)
+        liblinear_random_func = &rand;
+    else
+        liblinear_random_func = random_func;
+}
