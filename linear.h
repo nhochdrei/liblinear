@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 extern int liblinear_version;
+extern unsigned liblinear_threads;
 
 struct feature_node
 {

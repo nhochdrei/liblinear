@@ -4,9 +4,16 @@
 #include <string.h>
 #include <stdarg.h>
 #include <locale.h>
+
+#include <algorithm>
+#include <atomic>
+#include <thread>
+#include <vector>
+
 #include "linear.h"
 #include "tron.h"
 int liblinear_version = LIBLINEAR_VERSION;
+unsigned liblinear_threads = 1;
 typedef signed char schar;
 template <class T> static inline void swap(T& x, T& y) { T t=x; x=y; y=t; }
 #ifndef min
@@ -22,6 +29,11 @@ template <class S, class T> static inline void clone(T*& dst, S* src, int n)
 }
 #define INF HUGE_VAL
 #define Malloc(type,n) (type *)malloc((n)*sizeof(type))
+
+#ifndef CACHE_LINE_BYTES
+// Default to 128 bit
+#define CACHE_LINE_BYTES 16
+#endif
 
 static void print_string_stdout(const char *s)
 {
@@ -2554,34 +2566,58 @@ model* train(const problem *prob, const parameter *param)
 			}
 			else
 			{
-				model_->w=Malloc(double, w_size*nr_class);
-				double *w=Malloc(double, w_size);
-				for(i=0;i<nr_class;i++)
-				{
-					int si = start[i];
-					int ei = si+count[i];
+			    struct alignas(CACHE_LINE_BYTES) cache_line_double
+			    {
+			        double val;
+			        operator double() { return val; }
+			        cache_line_double& operator=(double rhs) { val = rhs; return *this; };
+			    };
 
-					k=0;
-					for(; k<si; k++)
-						sub_prob.y[k] = -1;
-					for(; k<ei; k++)
-						sub_prob.y[k] = +1;
-					for(; k<sub_prob.l; k++)
-						sub_prob.y[k] = -1;
+			    std::vector<cache_line_double> cache_aware_w(w_size*nr_class);
+			    std::vector<std::thread> workers;
+                auto threads = liblinear_threads;
+                workers.reserve(threads);
 
-					if(param->init_sol != NULL)
-						for(j=0;j<w_size;j++)
-							w[j] = param->init_sol[j*nr_class+i];
-					else
-						for(j=0;j<w_size;j++)
-							w[j] = 0;
+			    std::atomic_size_t current_class{0};
 
-					train_one(&sub_prob, param, w, weighted_C[i], param->C);
+			    // Simple work stealer
+			    for (auto t = 0u; t < threads; ++t)
+                {
+			        workers.emplace_back([&param, &cache_aware_w, &current_class, weighted_C, w_size, nr_class, l, count, start, sub_prob]() mutable {
+			            std::vector<double> w(w_size * nr_class), y(l);
+			            sub_prob.y = y.data();
+                        for (int i = current_class++; i < nr_class; i = current_class++)
+                        {
+                            int si = start[i];
+                            int ei = si + count[i];
 
-					for(j=0;j<w_size;j++)
-						model_->w[j*nr_class+i] = w[j];
-				}
-				free(w);
+                            int k = 0;
+                            for (; k < si; k++)
+                                sub_prob.y[k] = -1;
+                            for (; k < ei; k++)
+                                sub_prob.y[k] = +1;
+                            for (; k < sub_prob.l; k++)
+                                sub_prob.y[k] = -1;
+
+                            if (param->init_sol != NULL)
+                                for (int j = 0; j < w_size; j++)
+                                    w[j] = param->init_sol[j * nr_class + i];
+                            else
+                                for (int j = 0; j < w_size; j++)
+                                    w[j] = 0;
+
+                            train_one(&sub_prob, param, w.data(), weighted_C[i], param->C);
+
+                            for (int j = 0; j < w_size; j++)
+                                cache_aware_w[j * nr_class + i] = w[j];
+                        }
+                    });
+                }
+
+			    std::for_each(begin(workers), end(workers), [](std::thread& t) { t.join(); });
+
+                model_->w=Malloc(double, cache_aware_w.size());
+				std::copy(begin(cache_aware_w), end(cache_aware_w), model_->w);
 			}
 
 		}
