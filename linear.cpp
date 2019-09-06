@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <future>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -2574,7 +2576,7 @@ model* train(const problem *prob, const parameter *param)
 			    };
 
 			    std::vector<cache_line_double> cache_aware_w(w_size*nr_class);
-			    std::vector<std::thread> workers;
+			    std::vector<std::tuple<std::future<void>, std::thread>> workers;
                 auto threads = liblinear_threads;
                 workers.reserve(threads);
 
@@ -2583,38 +2585,78 @@ model* train(const problem *prob, const parameter *param)
 			    // Simple work stealer
 			    for (auto t = 0u; t < threads; ++t)
                 {
-			        workers.emplace_back([&param, &cache_aware_w, &current_class, weighted_C, w_size, nr_class, l, count, start, sub_prob]() mutable {
-			            std::vector<double> w(w_size * nr_class), y(l);
-			            sub_prob.y = y.data();
-                        for (int i = current_class++; i < nr_class; i = current_class++)
+			        using std::promise;
+			        using std::thread;
+
+			        promise<void> p;
+			        auto f = p.get_future();
+			        thread t_{[&param, &cache_aware_w, &current_class, weighted_C, w_size, nr_class, l, count, start, sub_prob, p = std::move(p)]() mutable {
+			            try
                         {
-                            int si = start[i];
-                            int ei = si + count[i];
+                            std::vector<double> w(w_size * nr_class), y(l);
+                            sub_prob.y = y.data();
+                            for (int i = current_class++; i < nr_class; i = current_class++)
+                            {
+                                int si = start[i];
+                                int ei = si + count[i];
 
-                            int k = 0;
-                            for (; k < si; k++)
-                                sub_prob.y[k] = -1;
-                            for (; k < ei; k++)
-                                sub_prob.y[k] = +1;
-                            for (; k < sub_prob.l; k++)
-                                sub_prob.y[k] = -1;
+                                int k = 0;
+                                for (; k < si; k++)
+                                    sub_prob.y[k] = -1;
+                                for (; k < ei; k++)
+                                    sub_prob.y[k] = +1;
+                                for (; k < sub_prob.l; k++)
+                                    sub_prob.y[k] = -1;
 
-                            if (param->init_sol != NULL)
+                                if (param->init_sol != NULL)
+                                    for (int j = 0; j < w_size; j++)
+                                        w[j] = param->init_sol[j * nr_class + i];
+                                else
+                                    for (int j = 0; j < w_size; j++)
+                                        w[j] = 0;
+
+                                train_one(&sub_prob, param, w.data(), weighted_C[i], param->C);
+
                                 for (int j = 0; j < w_size; j++)
-                                    w[j] = param->init_sol[j * nr_class + i];
-                            else
-                                for (int j = 0; j < w_size; j++)
-                                    w[j] = 0;
+                                    cache_aware_w[j * nr_class + i] = w[j];
+                            }
 
-                            train_one(&sub_prob, param, w.data(), weighted_C[i], param->C);
-
-                            for (int j = 0; j < w_size; j++)
-                                cache_aware_w[j * nr_class + i] = w[j];
+                            p.set_value_at_thread_exit();
                         }
-                    });
+			            catch (...)
+                        {
+			                p.set_exception(std::current_exception());
+                        }
+                    }};
+
+			        workers.emplace_back(std::move(f), std::move(t_));
                 }
 
-			    std::for_each(begin(workers), end(workers), [](std::thread& t) { t.join(); });
+			    auto join = [&workers] { std::for_each(begin(workers), end(workers), [](auto& t) { std::get<1>(t).join(); }); };
+
+			    try
+                {
+                    std::for_each(begin(workers), end(workers), [](auto& t) { std::get<0>(t).get(); });
+                    join();
+                }
+			    catch (...)
+                {
+			        join();
+
+                    free(x);
+                    free(label);
+                    free(start);
+                    free(count);
+                    free(perm);
+                    free(sub_prob.x);
+                    free(sub_prob.y);
+                    free(weighted_C);
+
+                    model_->w = nullptr;
+                    free_and_destroy_model(&model_);
+
+			        throw;
+                }
 
                 model_->w=Malloc(double, cache_aware_w.size());
 				std::copy(begin(cache_aware_w), end(cache_aware_w), model_->w);
@@ -2753,11 +2795,11 @@ void find_parameters(const problem *prob, const parameter *param, int nr_fold, d
 		if(start_C <= 0)
 			start_C = calc_start_C(prob, &param_tmp);
 		double max_C = 1024;
-		start_C = min(start_C, max_C);		
+		start_C = min(start_C, max_C);
 		double best_C_tmp, best_score_tmp;
-		
+
 		find_parameter_C(prob, &param_tmp, start_C, max_C, &best_C_tmp, &best_score_tmp, fold_start, perm, subprob, nr_fold);
-		
+
 		*best_C = best_C_tmp;
 		*best_score = best_score_tmp;
 	}
@@ -2781,9 +2823,9 @@ void find_parameters(const problem *prob, const parameter *param, int nr_fold, d
 				start_C_tmp = start_C;
 			start_C_tmp = min(start_C_tmp, max_C);
 			double best_C_tmp, best_score_tmp;
-			
+
 			find_parameter_C(prob, &param_tmp, start_C_tmp, max_C, &best_C_tmp, &best_score_tmp, fold_start, perm, subprob, nr_fold);
-			
+
 			if(best_score_tmp < *best_score)
 			{
 				*best_p = param_tmp.p;
@@ -2998,7 +3040,7 @@ struct model *load_model(const char *model_file_name)
 	// parameters for training only won't be assigned, but arrays are assigned as NULL for safety
 	param.nr_weight = 0;
 	param.weight_label = NULL;
-	param.weight = NULL;	
+	param.weight = NULL;
 	param.init_sol = NULL;
 
 	model_->label = NULL;
