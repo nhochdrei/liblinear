@@ -32,9 +32,89 @@ template <class S, class T> static inline void clone(T*& dst, S* src, int n)
 #define INF HUGE_VAL
 #define Malloc(type,n) (type *)malloc((n)*sizeof(type))
 
+#ifdef LIBLINEAR_N3_CACHE_AWARE
 #ifndef CACHE_LINE_BYTES
 // Default to 128 bit
 #define CACHE_LINE_BYTES 16
+#endif
+struct alignas(CACHE_LINE_BYTES) cache_line_double
+{
+    double val;
+    operator double() const { return val; }
+    cache_line_double& operator=(double rhs) { val = rhs; return *this; };
+};
+
+class threaded_vec_t
+{
+    std::vector<cache_line_double> content_;
+public:
+    using size_type = typename decltype(content_)::size_type;
+    using value_type = typename decltype(content_)::value_type;
+
+    template<typename Size>
+    explicit threaded_vec_t(Size size) : content_(size)
+    {}
+
+    void commit(double*& target) const
+    {
+        auto* t = Malloc(double, content_.size());
+        if (!t)
+            throw std::bad_alloc{};
+        target = t;
+        std::copy(begin(content_), end(content_), target);
+    }
+
+    value_type& operator[](size_type idx)
+    {
+        return content_[idx];
+    }
+
+    double operator[](size_type idx) const
+    {
+        return content_[idx];
+    }
+};
+#else
+template<typename Size>
+class threaded_vec_t
+{
+    double* data_;
+    bool committed_;
+public:
+    using size_type = Size;
+    using value_type = double;
+
+    explicit threaded_vec_t(size_type size) : data_(Malloc(double, size)), committed_(false)
+    {
+        if (!data_)
+            throw std::bad_alloc{};
+    }
+
+    ~threaded_vec_t()
+    {
+        if (!committed_)
+            free(data_);
+    }
+
+    value_type& operator[](size_type idx)
+    {
+        return data_[idx];
+    }
+
+    double operator[](size_type idx) const
+    {
+        return data_[idx];
+    }
+
+    void commit(double*& target)
+    {
+        target = data_;
+        committed_ = true; // prevent freeing
+    }
+};
+
+template<typename Size>
+explicit threaded_vec_t(Size size) -> threaded_vec_t<Size>;
 #endif
 
 static void print_string_stdout(const char *s)
@@ -2534,6 +2614,17 @@ model* train(const problem *prob, const parameter *param)
 		for(k=0; k<sub_prob.l; k++)
 			sub_prob.x[k] = x[k];
 
+		auto const cleanup = [&] {
+            free(x);
+            free(label);
+            free(start);
+            free(count);
+            free(perm);
+            free(sub_prob.x);
+            free(sub_prob.y);
+            free(weighted_C);
+        };
+
 		// multi-class svm by Crammer and Singer
 		if(param->solver_type == MCSVM_CS)
 		{
@@ -2568,14 +2659,7 @@ model* train(const problem *prob, const parameter *param)
 			}
 			else
 			{
-			    struct alignas(CACHE_LINE_BYTES) cache_line_double
-			    {
-			        double val;
-			        operator double() { return val; }
-			        cache_line_double& operator=(double rhs) { val = rhs; return *this; };
-			    };
-
-			    std::vector<cache_line_double> cache_aware_w(w_size*nr_class);
+			    threaded_vec_t threaded_w{w_size * nr_class};
 			    std::vector<std::tuple<std::future<void>, std::thread>> workers;
                 auto threads = liblinear_threads;
                 workers.reserve(threads);
@@ -2590,10 +2674,10 @@ model* train(const problem *prob, const parameter *param)
 
 			        promise<void> p;
 			        auto f = p.get_future();
-			        thread t_{[&param, &cache_aware_w, &current_class, weighted_C, w_size, nr_class, l, count, start, sub_prob, p = std::move(p)]() mutable {
+			        thread t_{[&param, &threaded_w, &current_class, weighted_C, w_size, nr_class, l, count, start, sub_prob, p = std::move(p)]() mutable {
 			            try
                         {
-                            std::vector<double> w(w_size * nr_class), y(l);
+                            std::vector<double> w(w_size), y(l);
                             sub_prob.y = y.data();
                             for (int i = current_class++; i < nr_class; i = current_class++)
                             {
@@ -2618,7 +2702,7 @@ model* train(const problem *prob, const parameter *param)
                                 train_one(&sub_prob, param, w.data(), weighted_C[i], param->C);
 
                                 for (int j = 0; j < w_size; j++)
-                                    cache_aware_w[j * nr_class + i] = w[j];
+                                    threaded_w[j * nr_class + i] = w[j];
                             }
 
                             p.set_value_at_thread_exit();
@@ -2643,14 +2727,7 @@ model* train(const problem *prob, const parameter *param)
                 {
 			        join();
 
-                    free(x);
-                    free(label);
-                    free(start);
-                    free(count);
-                    free(perm);
-                    free(sub_prob.x);
-                    free(sub_prob.y);
-                    free(weighted_C);
+                    cleanup();
 
                     model_->w = nullptr;
                     free_and_destroy_model(&model_);
@@ -2658,20 +2735,12 @@ model* train(const problem *prob, const parameter *param)
 			        throw;
                 }
 
-                model_->w=Malloc(double, cache_aware_w.size());
-				std::copy(begin(cache_aware_w), end(cache_aware_w), model_->w);
+			    threaded_w.commit(model_->w);
 			}
 
 		}
 
-		free(x);
-		free(label);
-		free(start);
-		free(count);
-		free(perm);
-		free(sub_prob.x);
-		free(sub_prob.y);
-		free(weighted_C);
+		cleanup();
 	}
 	return model_;
 }
