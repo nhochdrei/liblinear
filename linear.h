@@ -4,6 +4,8 @@
 #define LIBLINEAR_VERSION 230
 
 #ifdef __cplusplus
+#include <functional>
+#include <utility>
 extern "C" {
 #endif
 
@@ -52,7 +54,17 @@ struct model
 
 struct model* train(const struct problem *prob, const struct parameter *param);
 void cross_validation(const struct problem *prob, const struct parameter *param, int nr_fold, double *target);
-void find_parameters(const struct problem *prob, const struct parameter *param, int nr_fold, double start_C, double start_p, double *best_C, double *best_p, double *best_score);
+void find_parameters(const struct problem *prob, const struct parameter *param, int nr_fold, double start_C, double start_p, double *best_C, double *best_p, double *best_score, int (*callback)(long, void*), void* callbackData);
+#ifdef __cplusplus
+extern "C++"
+template<typename Callback>
+void find_parameters(const struct problem *prob, const struct parameter *param, int nr_fold, double start_C, double start_p, double *best_C, double *best_p, double *best_score, Callback&& callback)
+{
+    using ft = std::function<bool(long)>;
+    ft bound{std::forward<Callback>(callback)};
+    find_parameters(prob, param, nr_fold, start_C, start_p, best_C, best_p, best_score, [](long it, void* data) { return (*static_cast<ft*>(data))(it) ? 1 : 0; }, &bound);
+}
+#endif
 
 double predict_values(const struct model *model_, const struct feature_node *x, double* dec_values);
 double predict(const struct model *model_, const struct feature_node *x);
