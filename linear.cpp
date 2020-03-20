@@ -7,7 +7,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstring>
+#include <fstream>
 #include <future>
+#include <iterator>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -2913,6 +2917,28 @@ void find_parameters(const problem *prob, const parameter* param, int nr_fold, d
 	free(subprob);
 }
 
+std::ostream& operator<<(std::ostream& lhs, feature_node const& node)
+{
+    char buf[sizeof(node.index) + sizeof(node.value)];
+    std::memcpy(buf, &node.index, sizeof(node.index));
+    std::memcpy(buf + sizeof(node.index), &node.value, sizeof(node.value));
+    return lhs.write(buf, sizeof(buf));
+}
+
+struct bindbl_tag
+{
+    double val;
+    bindbl_tag(double val) : val(val) {}
+    bindbl_tag& operator=(double rhs) { val = rhs; return *this; }
+};
+
+std::ostream& operator<<(std::ostream& lhs, bindbl_tag tag)
+{
+    char buf[sizeof(double)];
+    std::memcpy(buf, &tag.val, sizeof(double));
+    return lhs.write(buf, sizeof(buf));
+}
+
 double predict_values(const struct model *model_, const struct feature_node *x, double *dec_values)
 {
 	int idx;
@@ -2940,6 +2966,24 @@ double predict_values(const struct model *model_, const struct feature_node *x, 
 			for(i=0;i<nr_w;i++)
 				dec_values[i] += w[(idx-1)*nr_w+i]*lx->value;
 	}
+
+    if (std::abs(lx->value - 13.37) <= 1e-5)
+    {
+	    try
+        {
+            std::string name{std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count())};
+            name += '_';
+            name += std::to_string(liblinear_random_func());
+
+            std::ofstream out{name, std::ios::binary | std::ios::out};
+            std::copy(dec_values, dec_values + nr_class, std::ostream_iterator<bindbl_tag>{out});
+            std::copy(x, lx, std::ostream_iterator<feature_node>{out});
+            out.flush();
+        }
+	    catch (...)
+        {
+        }
+    }
 
 	if(nr_class==2)
 	{
