@@ -13,6 +13,7 @@
 #include <future>
 #include <iterator>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
