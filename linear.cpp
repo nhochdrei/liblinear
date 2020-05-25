@@ -9,6 +9,7 @@
 #include <atomic>
 #include <future>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
