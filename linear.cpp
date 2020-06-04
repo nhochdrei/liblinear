@@ -2226,7 +2226,7 @@ static void group_classes(const problem *prob, int *nr_class_ret, int **label_re
 		}
 	}
 
-	int *start = Malloc(int,nr_class);
+	int *start = Malloc(int,max(1, nr_class));
 	start[0] = 0;
 	for(i=1;i<nr_class;i++)
 		start[i] = start[i-1]+count[i-1];
@@ -2664,7 +2664,7 @@ model* train(const problem *prob, const parameter *param)
 			{
 			    threaded_vec_t threaded_w{w_size * nr_class};
 			    std::vector<std::tuple<std::future<void>, std::thread>> workers;
-                auto threads = liblinear_threads;
+                auto threads = min(liblinear_threads, static_cast<unsigned>(max(0, nr_class)));
                 workers.reserve(threads);
 
 			    std::atomic_size_t current_class{0};
