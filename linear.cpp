@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <future>
 #include <stdexcept>
 #include <string>
@@ -25,13 +26,7 @@ template <class T> static inline T min(T x,T y) { return (x<y)?x:y; }
 #ifndef max
 template <class T> static inline T max(T x,T y) { return (x>y)?x:y; }
 #endif
-template <class S, class T> static inline void clone(T*& dst, S* src, int n)
-{
-	dst = new T[n];
-	memcpy((void *)dst,(void *)src,sizeof(T)*n);
-}
 #define INF HUGE_VAL
-#define Malloc(type,n) (type *)malloc((n)*sizeof(type))
 
 #ifdef LIBLINEAR_N3_CACHE_AWARE
 #ifndef CACHE_LINE_BYTES
@@ -58,19 +53,17 @@ public:
 
     void commit(double*& target) const
     {
-        auto* t = Malloc(double, content_.size());
-        if (!t)
-            throw std::bad_alloc{};
+        auto* t = new double[content_.size()];
         target = t;
         std::copy(begin(content_), end(content_), target);
     }
 
-    value_type& operator[](size_type idx)
+    value_type& operator[](size_type idx) noexcept
     {
         return content_[idx];
     }
 
-    double operator[](size_type idx) const
+    double operator[](size_type idx) const noexcept
     {
         return content_[idx];
     }
@@ -79,38 +72,28 @@ public:
 template<typename Size>
 class threaded_vec_t
 {
-    double* data_;
-    bool committed_;
+    std::unique_ptr<double[]> data_;
 public:
     using size_type = Size;
     using value_type = double;
 
-    explicit threaded_vec_t(size_type size) : data_(Malloc(double, size)), committed_(false)
+    explicit threaded_vec_t(size_type size) : data_(new double[size])
     {
-        if (!data_)
-            throw std::bad_alloc{};
     }
 
-    ~threaded_vec_t()
-    {
-        if (!committed_)
-            free(data_);
-    }
-
-    value_type& operator[](size_type idx)
+    value_type& operator[](size_type idx) noexcept
     {
         return data_[idx];
     }
 
-    double operator[](size_type idx) const
+    double operator[](size_type idx) const noexcept
     {
         return data_[idx];
     }
 
-    void commit(double*& target)
+    void commit(double*& target) noexcept
     {
-        target = data_;
-        committed_ = true; // prevent freeing
+        target = data_.release();
     }
 };
 
@@ -199,23 +182,35 @@ private:
 	const problem *prob;
 };
 
-l2r_lr_fun::l2r_lr_fun(const problem *prob, double *C)
+l2r_lr_fun::l2r_lr_fun(const problem *prob, double *C) : z(nullptr), D(nullptr)
 {
-	int l=prob->l;
+    try
+    {
+        int l = prob->l;
 
-	this->prob = prob;
+        this->prob = prob;
 
-	z = new double[l];
-	D = new double[l];
-	this->C = C;
+        z = new double[l];
+        D = new double[l];
+        this->C = C;
+    }
+    catch (...)
+    {
+        // safe to call due to being initialized to nullptr
+        delete[] z;
+        delete[] D;
+        // just in case the destructor is still somehow run
+        z = nullptr;
+        D = nullptr;
+        throw;
+    }
 }
 
 l2r_lr_fun::~l2r_lr_fun()
 {
-	delete[] z;
-	delete[] D;
+    delete[] D;
+    delete[] z;
 }
-
 
 double l2r_lr_fun::fun(double *w)
 {
@@ -356,14 +351,24 @@ protected:
 	const problem *prob;
 };
 
-l2r_l2_svc_fun::l2r_l2_svc_fun(const problem *prob, double *C)
+l2r_l2_svc_fun::l2r_l2_svc_fun(const problem *prob, double *C) : z(nullptr), I(nullptr)
 {
 	int l=prob->l;
 
 	this->prob = prob;
 
-	z = new double[l];
-	I = new int[l];
+	try
+    {
+        z = new double[l];
+        I = new int[l];
+    } catch(...)
+    {
+	    delete[] z;
+	    delete[] I;
+	    z = nullptr;
+	    I = nullptr;
+	    throw;
+    }
 	this->C = C;
 }
 
@@ -605,7 +610,7 @@ class Solver_MCSVM_CS
 		const problem *prob;
 };
 
-Solver_MCSVM_CS::Solver_MCSVM_CS(const problem *prob, int nr_class, double *weighted_C, double eps, int max_iter)
+Solver_MCSVM_CS::Solver_MCSVM_CS(const problem *prob, int nr_class, double *weighted_C, double eps, int max_iter) : B(nullptr), G(nullptr)
 {
 	this->w_size = prob->n;
 	this->l = prob->l;
@@ -613,8 +618,18 @@ Solver_MCSVM_CS::Solver_MCSVM_CS(const problem *prob, int nr_class, double *weig
 	this->eps = eps;
 	this->max_iter = max_iter;
 	this->prob = prob;
-	this->B = new double[nr_class];
-	this->G = new double[nr_class];
+	try
+    {
+        this->B = new double[nr_class];
+        this->G = new double[nr_class];
+    } catch (...)
+    {
+	    delete[] B;
+	    delete[] G;
+	    B = nullptr;
+	    G = nullptr;
+	    throw;
+    }
 	this->C = weighted_C;
 }
 
@@ -636,12 +651,13 @@ int compare_double(const void *a, const void *b)
 void Solver_MCSVM_CS::solve_sub_problem(double A_i, int yi, double C_yi, int active_i, double *alpha_new)
 {
 	int r;
-	double *D;
 
-	clone(D, B, active_i);
+	std::unique_ptr<double[]> D{new double[active_i]};
+	memcpy(D.get(), B, sizeof(double) * active_i);
+
 	if(yi < active_i)
 		D[yi] += A_i*C_yi;
-	qsort(D, active_i, sizeof(double), compare_double);
+	qsort(D.get(), active_i, sizeof(double), compare_double);
 
 	double beta = D[0] - A_i*C_yi;
 	for(r=1;r<active_i && beta<r*D[r];r++)
@@ -655,7 +671,6 @@ void Solver_MCSVM_CS::solve_sub_problem(double A_i, int yi, double C_yi, int act
 		else
 			alpha_new[r] = min((double)0, (beta - B[r])/A_i);
 	}
-	delete[] D;
 }
 
 bool Solver_MCSVM_CS::be_shrunk(int i, int m, int yi, double alpha_i, double minG)
@@ -672,16 +687,16 @@ void Solver_MCSVM_CS::Solve(double *w)
 {
 	int i, m, s;
 	int iter = 0;
-	double *alpha =  new double[l*nr_class];
-	double *alpha_new = new double[nr_class];
-	int *index = new int[l];
-	double *QD = new double[l];
-	int *d_ind = new int[nr_class];
-	double *d_val = new double[nr_class];
-	int *alpha_index = new int[nr_class*l];
-	int *y_index = new int[l];
+	std::unique_ptr<double[]> alpha{new double[l*nr_class]};
+	std::unique_ptr<double[]> alpha_new{new double[nr_class]};
+	std::unique_ptr<int[]> index{new int[l]};
+	std::unique_ptr<double[]> QD{new double[l]};
+	std::unique_ptr<int[]> d_ind{new int[nr_class]};
+	std::unique_ptr<double[]> d_val{new double[nr_class]};
+	std::unique_ptr<int[]> alpha_index{new int[nr_class*l]};
+	std::unique_ptr<int[]> y_index{new int[l]};
 	int active_size = l;
-	int *active_size_i = new int[l];
+	std::unique_ptr<int[]> active_size_i{new int[l]};
 	double eps_shrink = max(10.0*eps, 1.0); // stopping tolerance for shrinking
 	bool start_from_all = true;
 
@@ -799,7 +814,7 @@ void Solver_MCSVM_CS::Solve(double *w)
 				for(m=0;m<active_size_i[i];m++)
 					B[m] = G[m] - Ai*alpha_i[alpha_index_i[m]] ;
 
-				solve_sub_problem(Ai, y_index[i], C[GETI(i)], active_size_i[i], alpha_new);
+				solve_sub_problem(Ai, y_index[i], C[GETI(i)], active_size_i[i], alpha_new.get());
 				int nz_d = 0;
 				for(m=0;m<active_size_i[i];m++)
 				{
@@ -868,16 +883,6 @@ void Solver_MCSVM_CS::Solve(double *w)
 		v -= alpha[i*nr_class+(int)prob->y[i]];
 	info("Objective value = %lf\n",v);
 	info("nSV = %d\n",nSV);
-
-	delete [] alpha;
-	delete [] alpha_new;
-	delete [] index;
-	delete [] QD;
-	delete [] d_ind;
-	delete [] d_val;
-	delete [] alpha_index;
-	delete [] y_index;
-	delete [] active_size_i;
 }
 
 // A coordinate descent algorithm for
@@ -918,11 +923,11 @@ static void solve_l2r_l1l2_svc(
 	int w_size = prob->n;
 	int i, s, iter = 0;
 	double C, d, G;
-	double *QD = new double[l];
+	std::unique_ptr<double[]> QD{new double[l]};
 	int max_iter = 1000;
-	int *index = new int[l];
-	double *alpha = new double[l];
-	schar *y = new schar[l];
+	std::unique_ptr<int[]> index{new int[l]};
+	std::unique_ptr<double[]> alpha{new double[l]};
+	std::unique_ptr<schar[]> y{new schar[l]};
 	int active_size = l;
 
 	// PG: projected gradient, for shrinking and stopping
@@ -1077,11 +1082,6 @@ static void solve_l2r_l1l2_svc(
 	}
 	info("Objective value = %lf\n",v/2);
 	info("nSV = %d\n",nSV);
-
-	delete [] QD;
-	delete [] alpha;
-	delete [] y;
-	delete [] index;
 }
 
 
@@ -1125,15 +1125,15 @@ static void solve_l2r_l1l2_svr(
 	int i, s, iter = 0;
 	int max_iter = 1000;
 	int active_size = l;
-	int *index = new int[l];
+	std::unique_ptr<int[]> index{new int[l]};
 
 	double d, G, H;
 	double Gmax_old = INF;
 	double Gmax_new, Gnorm1_new;
-	double Gnorm1_init = -1.0; // Gnorm1_init is initialized at the first iteration
-	double *beta = new double[l];
-	double *QD = new double[l];
-	double *y = prob->y;
+	double Gnorm1_init = -1.0; // Gnorm1_init is initialized at the first iterations
+	std::unique_ptr<double[]> beta{new double[l]};
+	std::unique_ptr<double[]> QD{new double[l]};
+    double *y = prob->y;
 
 	// L2R_L2LOSS_SVR_DUAL
 	double lambda[1], upper_bound[1];
@@ -1292,10 +1292,6 @@ static void solve_l2r_l1l2_svr(
 
 	info("Objective value = %lf\n", v);
 	info("nSV = %d\n",nSV);
-
-	delete [] beta;
-	delete [] QD;
-	delete [] index;
 }
 
 
@@ -1326,11 +1322,11 @@ void solve_l2r_lr_dual(const problem *prob, double *w, double eps, double Cp, do
 	int l = prob->l;
 	int w_size = prob->n;
 	int i, s, iter = 0;
-	double *xTx = new double[l];
+	std::unique_ptr<double[]> xTx{new double[l]};
 	int max_iter = 1000;
-	int *index = new int[l];
-	double *alpha = new double[2*l]; // store alpha and C - alpha
-	schar *y = new schar[l];
+	std::unique_ptr<int[]> index{new int[l]};
+	std::unique_ptr<double[]> alpha{new double[2*l]}; // store alpha and C - alpha
+	std::unique_ptr<schar[]> y{new schar[l]};
 	int max_inner_iter = 100; // for inner Newton
 	double innereps = 1e-2;
 	double innereps_min = min(1e-8, eps);
@@ -1455,11 +1451,6 @@ void solve_l2r_lr_dual(const problem *prob, double *w, double eps, double Cp, do
 		v += alpha[2*i] * log(alpha[2*i]) + alpha[2*i+1] * log(alpha[2*i+1])
 			- upper_bound[GETI(i)] * log(upper_bound[GETI(i)]);
 	info("Objective value = %lf\n", v);
-
-	delete [] xTx;
-	delete [] alpha;
-	delete [] y;
-	delete [] index;
 }
 
 // A coordinate descent algorithm for
@@ -1499,10 +1490,10 @@ static void solve_l1r_l2_svc(
 	double loss_old = 0, loss_new;
 	double appxcond, cond;
 
-	int *index = new int[w_size];
-	schar *y = new schar[l];
-	double *b = new double[l]; // b = 1-ywTx
-	double *xj_sq = new double[w_size];
+	std::unique_ptr<int[]> index{new int[w_size]};
+	std::unique_ptr<schar[]> y{new schar[l]};
+	std::unique_ptr<double[]> b{new double[l]}; // b = 1-ywTx
+	std::unique_ptr<double[]> xj_sq{new double[w_size]};
 	feature_node *x;
 
 	double C[3] = {Cn,0,Cp};
@@ -1619,7 +1610,7 @@ static void solve_l1r_l2_svc(
 				if(appxcond <= 0)
 				{
 					x = prob_col->x[j];
-					sparse_operator::axpy(d_diff, x, b);
+					sparse_operator::axpy(d_diff, x, b.get());
 					break;
 				}
 
@@ -1679,7 +1670,7 @@ static void solve_l1r_l2_svc(
 				{
 					if(w[i]==0) continue;
 					x = prob_col->x[i];
-					sparse_operator::axpy(-w[i], x, b);
+					sparse_operator::axpy(-w[i], x, b.get());
 				}
 			}
 		}
@@ -1734,11 +1725,6 @@ static void solve_l1r_l2_svc(
 
 	info("Objective value = %lf\n", v);
 	info("#nonzeros/#features = %d/%d\n", nnz, w_size);
-
-	delete [] index;
-	delete [] y;
-	delete [] b;
-	delete [] xj_sq;
 }
 
 // A coordinate descent algorithm for
@@ -1783,16 +1769,16 @@ static void solve_l1r_lr(
 	double QP_Gmax_new, QP_Gnorm1_new;
 	double delta, negsum_xTd, cond;
 
-	int *index = new int[w_size];
-	schar *y = new schar[l];
-	double *Hdiag = new double[w_size];
-	double *Grad = new double[w_size];
-	double *wpd = new double[w_size];
-	double *xjneg_sum = new double[w_size];
-	double *xTd = new double[l];
-	double *exp_wTx = new double[l];
-	double *exp_wTx_new = new double[l];
-	double *tau = new double[l];
+	std::unique_ptr<int[]> index{new int[w_size]};
+	std::unique_ptr<schar[]> y{new schar[l]};
+	std::unique_ptr<double[]> Hdiag{new double[w_size]};
+	std::unique_ptr<double[]> Grad{new double[w_size]};
+	std::unique_ptr<double[]> wpd{new double[w_size]};
+	std::unique_ptr<double[]> xjneg_sum{new double[w_size]};
+	std::unique_ptr<double[]> xTd{new double[l]};
+	std::unique_ptr<double[]> exp_wTx{new double[l]};
+	std::unique_ptr<double[]> exp_wTx_new{new double[l]};
+	std::unique_ptr<double[]> tau{new double[l]};
 	double *D = new double[l];
 	feature_node *x;
 
@@ -1968,7 +1954,7 @@ static void solve_l1r_lr(
 				wpd[j] += z;
 
 				x = prob_col->x[j];
-				sparse_operator::axpy(z, x, xTd);
+				sparse_operator::axpy(z, x, xTd.get());
 			}
 
 			iter++;
@@ -2060,7 +2046,7 @@ static void solve_l1r_lr(
 			{
 				if(w[i]==0) continue;
 				x = prob_col->x[i];
-				sparse_operator::axpy(w[i], x, exp_wTx);
+				sparse_operator::axpy(w[i], x, exp_wTx.get());
 			}
 
 			for(int i=0; i<l; i++)
@@ -2099,18 +2085,6 @@ static void solve_l1r_lr(
 
 	info("Objective value = %lf\n", v);
 	info("#nonzeros/#features = %d/%d\n", nnz, w_size);
-
-	delete [] index;
-	delete [] y;
-	delete [] Hdiag;
-	delete [] Grad;
-	delete [] wpd;
-	delete [] xjneg_sum;
-	delete [] xTd;
-	delete [] exp_wTx;
-	delete [] exp_wTx_new;
-	delete [] tau;
-	delete [] D;
 }
 
 // transpose matrix X from row format to column format
@@ -2120,15 +2094,17 @@ static void transpose(const problem *prob, feature_node **x_space_ret, problem *
 	int l = prob->l;
 	int n = prob->n;
 	size_t nnz = 0;
-	size_t *col_ptr = new size_t [n+1];
-	feature_node *x_space;
+	std::unique_ptr<size_t[]> col_ptr{new size_t [n+1]};
 	prob_col->l = l;
 	prob_col->n = n;
-	prob_col->y = new double[l];
-	prob_col->x = new feature_node*[n];
+	prob_col->y = nullptr;
+	prob_col->x = nullptr;
+
+    std::unique_ptr<double[]> prob_col_y_storage{new double[l]};
+    std::unique_ptr<feature_node*[]> prob_col_x_storage{new feature_node*[n]};
 
 	for(i=0; i<l; i++)
-		prob_col->y[i] = prob->y[i];
+		prob_col_y_storage[i] = prob->y[i];
 
 	for(i=0; i<n+1; i++)
 		col_ptr[i] = 0;
@@ -2145,9 +2121,9 @@ static void transpose(const problem *prob, feature_node **x_space_ret, problem *
 	for(i=1; i<n+1; i++)
 		col_ptr[i] += col_ptr[i-1] + 1;
 
-	x_space = new feature_node[nnz+n];
+	std::unique_ptr<feature_node[]> x_space{new feature_node[nnz+n]};
 	for(i=0; i<n; i++)
-		prob_col->x[i] = &x_space[col_ptr[i]];
+		prob_col_x_storage[i] = &x_space[col_ptr[i]];
 
 	for(i=0; i<l; i++)
 	{
@@ -2164,86 +2140,87 @@ static void transpose(const problem *prob, feature_node **x_space_ret, problem *
 	for(i=0; i<n; i++)
 		x_space[col_ptr[i]].index = -1;
 
-	*x_space_ret = x_space;
-
-	delete [] col_ptr;
+	*x_space_ret = x_space.release();
+	prob_col->x = prob_col_x_storage.release();
+	prob_col->y = prob_col_y_storage.release();
 }
 
 // label: label name, start: begin of each class, count: #data of classes, perm: indices to the original data
 // perm, length l, must be allocated before calling this subroutine
-static void group_classes(const problem *prob, int *nr_class_ret, int **label_ret, int **start_ret, int **count_ret, int *perm)
+static void group_classes(const problem *prob, int *nr_class_ret, std::unique_ptr<int[]>& label, std::unique_ptr<int[]>& start, std::unique_ptr<int[]>& count, int *perm)
 {
-	int l = prob->l;
-	int max_nr_class = 16;
-	int nr_class = 0;
-	int *label = Malloc(int,max_nr_class);
-	int *count = Malloc(int,max_nr_class);
-	int *data_label = Malloc(int,l);
-	int i;
+    int l = prob->l;
+    int max_nr_class = 16;
+    int nr_class = 0;
+    label.reset(new int[max_nr_class]);
+    count.reset(new int[max_nr_class]);
+    std::unique_ptr<int[]> data_label{new int[l]};
+    int i;
 
-	for(i=0;i<l;i++)
-	{
-		int this_label = (int)prob->y[i];
-		int j;
-		for(j=0;j<nr_class;j++)
-		{
-			if(this_label == label[j])
-			{
-				++count[j];
-				break;
-			}
-		}
-		data_label[i] = j;
-		if(j == nr_class)
-		{
-			if(nr_class == max_nr_class)
-			{
-				max_nr_class *= 2;
-				label = (int *)realloc(label,max_nr_class*sizeof(int));
-				count = (int *)realloc(count,max_nr_class*sizeof(int));
-			}
-			label[nr_class] = this_label;
-			count[nr_class] = 1;
-			++nr_class;
-		}
-	}
+    for (i = 0; i < l; i++)
+    {
+        int this_label = (int) prob->y[i];
+        int j;
+        for (j = 0; j < nr_class; j++)
+        {
+            if (this_label == label[j])
+            {
+                ++count[j];
+                break;
+            }
+        }
+        data_label[i] = j;
+        if (j == nr_class)
+        {
+            if (nr_class == max_nr_class)
+            {
+                max_nr_class *= 2;
+                auto new_label = new int[max_nr_class];
+                memmove(new_label, label.get(), nr_class * sizeof(int));
+                label.reset(new_label);
 
-	//
-	// Labels are ordered by their first occurrence in the training set.
-	// However, for two-class sets with -1/+1 labels and -1 appears first,
-	// we swap labels to ensure that internally the binary SVM has positive data corresponding to the +1 instances.
-	//
-	if (nr_class == 2 && label[0] == -1 && label[1] == 1)
-	{
-		swap(label[0],label[1]);
-		swap(count[0],count[1]);
-		for(i=0;i<l;i++)
-		{
-			if(data_label[i] == 0)
-				data_label[i] = 1;
-			else
-				data_label[i] = 0;
-		}
-	}
+                auto new_count = new int[max_nr_class];
+                memmove(new_count, count.get(), nr_class * sizeof(int));
+                count.reset(new_count);
+            }
+            label[nr_class] = this_label;
+            count[nr_class] = 1;
+            ++nr_class;
+        }
+    }
 
-	int *start = Malloc(int,max(1, nr_class));
-	start[0] = 0;
-	for(i=1;i<nr_class;i++)
-		start[i] = start[i-1]+count[i-1];
-	for(i=0;i<l;i++)
-	{
-		perm[start[data_label[i]]] = i;
-		++start[data_label[i]];
-	}
-	start[0] = 0;
-	for(i=1;i<nr_class;i++)
-		start[i] = start[i-1]+count[i-1];
+    //
+    // Labels are ordered by their first occurrence in the training set.
+    // However, for two-class sets with -1/+1 labels and -1 appears first,
+    // we swap labels to ensure that internally the binary SVM has positive data corresponding to the +1 instances.
+    //
+    if (nr_class == 2 && label[0] == -1 && label[1] == 1)
+    {
+        swap(label[0], label[1]);
+        swap(count[0], count[1]);
+        for (i = 0; i < l; i++)
+        {
+            if (data_label[i] == 0)
+                data_label[i] = 1;
+            else
+                data_label[i] = 0;
+        }
+    }
 
-	*nr_class_ret = nr_class;
-	*label_ret = label;
-	*start_ret = start;
-	*count_ret = count;
-	free(data_label);
+    start.reset(new int[max(1, nr_class)]);
+    start[0] = 0;
+    for (i = 1; i < nr_class; i++)
+        start[i] = start[i - 1] + count[i - 1];
+    for (i = 0; i < l; i++)
+    {
+        perm[start[data_label[i]]] = i;
+        ++start[data_label[i]];
+    }
+    start[0] = 0;
+    for (i = 1; i < nr_class; i++)
+        start[i] = start[i - 1] + count[i - 1];
+
+    *nr_class_ret = nr_class;
 }
 
 static void train_one(const problem *prob, const parameter *param, double *w, double Cp, double Cn)
@@ -2262,12 +2239,11 @@ static void train_one(const problem *prob, const parameter *param, double *w, do
 	neg = prob->l - pos;
 	double primal_solver_tol = eps*max(min(pos,neg), 1)/prob->l;
 
-	function *fun_obj=NULL;
 	switch(param->solver_type)
 	{
 		case L2R_LR:
 		{
-			double *C = new double[prob->l];
+            std::unique_ptr<double[]> C{new double[prob->l]};
 			for(int i = 0; i < prob->l; i++)
 			{
 				if(prob->y[i] > 0)
@@ -2275,17 +2251,15 @@ static void train_one(const problem *prob, const parameter *param, double *w, do
 				else
 					C[i] = Cn;
 			}
-			fun_obj=new l2r_lr_fun(prob, C);
-			TRON tron_obj(fun_obj, primal_solver_tol, eps_cg);
+			l2r_lr_fun fun_obj{prob, C.get()};
+			TRON tron_obj(&fun_obj, primal_solver_tol, eps_cg);
 			tron_obj.set_print_string(liblinear_print_string);
 			tron_obj.tron(w);
-			delete fun_obj;
-			delete[] C;
 			break;
 		}
 		case L2R_L2LOSS_SVC:
 		{
-			double *C = new double[prob->l];
+            std::unique_ptr<double[]> C{new double[prob->l]};
 			for(int i = 0; i < prob->l; i++)
 			{
 				if(prob->y[i] > 0)
@@ -2293,12 +2267,10 @@ static void train_one(const problem *prob, const parameter *param, double *w, do
 				else
 					C[i] = Cn;
 			}
-			fun_obj=new l2r_l2_svc_fun(prob, C);
-			TRON tron_obj(fun_obj, primal_solver_tol, eps_cg);
+			l2r_l2_svc_fun fun_obj{prob, C.get()};
+			TRON tron_obj(&fun_obj, primal_solver_tol, eps_cg);
 			tron_obj.set_print_string(liblinear_print_string);
 			tron_obj.tron(w);
-			delete fun_obj;
-			delete[] C;
 			break;
 		}
 		case L2R_L2LOSS_SVC_DUAL:
@@ -2334,16 +2306,14 @@ static void train_one(const problem *prob, const parameter *param, double *w, do
 			break;
 		case L2R_L2LOSS_SVR:
 		{
-			double *C = new double[prob->l];
+			std::unique_ptr<double[]> C{new double[prob->l]};
 			for(int i = 0; i < prob->l; i++)
 				C[i] = param->C;
 
-			fun_obj=new l2r_l2_svr_fun(prob, C, param->p);
-			TRON tron_obj(fun_obj, param->eps);
+			l2r_l2_svr_fun fun_obj{prob, C.get(), param->p};
+			TRON tron_obj(&fun_obj, param->eps);
 			tron_obj.set_print_string(liblinear_print_string);
 			tron_obj.tron(w);
-			delete fun_obj;
-			delete[] C;
 			break;
 
 		}
@@ -2419,13 +2389,11 @@ static void find_parameter_C(const problem *prob, parameter *param_tmp, double s
 {
 	// variables for CV
 	int i;
-	double *target = Malloc(double, prob->l);
+	std::unique_ptr<double[]> target{new double[prob->l]};
 
 	// variables for warm start
 	double ratio = 2;
-	double **prev_w = Malloc(double*, nr_fold);
-	for(i = 0; i < nr_fold; i++)
-		prev_w[i] = NULL;
+	std::unique_ptr<std::unique_ptr<double[]>[]> prev_w{new std::unique_ptr<double[]>[nr_fold]};
 	int num_unchanged_w = 0;
 	long iterations = 0;
 	void (*default_print_string) (const char *) = liblinear_print_string;
@@ -2448,8 +2416,8 @@ static void find_parameter_C(const problem *prob, parameter *param_tmp, double s
 			int begin = fold_start[i];
 			int end = fold_start[i+1];
 
-			param_tmp->init_sol = prev_w[i];
-			struct model *submodel = train(&subprob[i],param_tmp);
+			param_tmp->init_sol = prev_w[i].get();
+			liblinear::model_ptr_t submodel{train(&subprob[i],param_tmp)};
 
 			int total_w_size;
 			if(submodel->nr_class == 2)
@@ -2457,9 +2425,9 @@ static void find_parameter_C(const problem *prob, parameter *param_tmp, double s
 			else
 				total_w_size = subprob[i].n * submodel->nr_class;
 
-			if(prev_w[i] == NULL)
+			if(prev_w[i] == nullptr)
 			{
-				prev_w[i] = Malloc(double, total_w_size);
+				prev_w[i].reset(new double[total_w_size]);
 				for(j=0; j<total_w_size; j++)
 					prev_w[i][j] = submodel->w[j];
 			}
@@ -2483,9 +2451,7 @@ static void find_parameter_C(const problem *prob, parameter *param_tmp, double s
 			}
 
 			for(j=begin; j<end; j++)
-				target[perm[j]] = predict(submodel,prob->x[perm[j]]);
-
-			free_and_destroy_model(&submodel);
+				target[perm[j]] = predict(submodel.get(),prob->x[perm[j]]);
 		}
 		set_print_string_function(default_print_string);
 
@@ -2531,387 +2497,373 @@ static void find_parameter_C(const problem *prob, parameter *param_tmp, double s
 
 	if(param_tmp->C > max_C)
 		info("warning: maximum C reached.\n");
-	free(target);
-	for(i=0; i<nr_fold; i++)
-		free(prev_w[i]);
-	free(prev_w);
 }
-
 
 //
 // Interface functions
 //
+
 model* train(const problem *prob, const parameter *param)
 {
-	int i,j;
-	int l = prob->l;
-	int n = prob->n;
-	int w_size = prob->n;
-	model *model_ = Malloc(model,1);
+    try
+    {
+        return liblinear::train(prob, param).release();
+    } catch (std::exception const& e)
+    {
+        info("exception in train: %s", e.what());
+    } catch (...)
+    {
+        info("unknown exception in train");
+    }
 
-	if(prob->bias>=0)
-		model_->nr_feature=n-1;
-	else
-		model_->nr_feature=n;
-	model_->param = *param;
-	model_->bias = prob->bias;
+    return nullptr;
+}
 
-	if(check_regression_model(model_))
-	{
-		model_->w = Malloc(double, w_size);
+namespace liblinear {
+    model_ptr_t train(const problem *prob, const parameter *param)
+    {
+        int i, j;
+        int l = prob->l;
+        int n = prob->n;
+        int w_size = prob->n;
+        model_ptr_t model_{new model};
 
-		if(param->init_sol != NULL)
-			for(i=0;i<w_size;i++)
-				model_->w[i] = param->init_sol[i];
-		else
-			for(i=0;i<w_size;i++)
-				model_->w[i] = 0;
+        if (prob->bias >= 0)
+            model_->nr_feature = n - 1;
+        else
+            model_->nr_feature = n;
+        model_->param = *param;
+        model_->bias = prob->bias;
 
-		model_->nr_class = 2;
-		model_->label = NULL;
-		train_one(prob, param, model_->w, 0, 0);
-	}
-	else
-	{
-		int nr_class;
-		int *label = NULL;
-		int *start = NULL;
-		int *count = NULL;
-		int *perm = Malloc(int,l);
+        model_->label = nullptr;
+        model_->w = nullptr;
 
-		// group training data of the same class
-		group_classes(prob,&nr_class,&label,&start,&count,perm);
+        if (check_regression_model(model_.get()))
+        {
+            std::unique_ptr<double[]> w_store{new double[w_size]};
 
-		model_->nr_class=nr_class;
-		model_->label = Malloc(int,nr_class);
-		for(i=0;i<nr_class;i++)
-			model_->label[i] = label[i];
+            if (param->init_sol != NULL)
+                for (i = 0; i < w_size; i++)
+                    w_store[i] = param->init_sol[i];
+            else
+                for (i = 0; i < w_size; i++)
+                    w_store[i] = 0;
 
-		// calculate weighted C
-		double *weighted_C = Malloc(double, nr_class);
-		for(i=0;i<nr_class;i++)
-			weighted_C[i] = param->C;
-		for(i=0;i<param->nr_weight;i++)
-		{
-			for(j=0;j<nr_class;j++)
-				if(param->weight_label[i] == label[j])
-					break;
-			if(j == nr_class)
-				fprintf(stderr,"WARNING: class label %d specified in weight is not found\n", param->weight_label[i]);
-			else
-				weighted_C[j] *= param->weight[i];
-		}
+            model_->nr_class = 2;
+            train_one(prob, param, w_store.get(), 0, 0);
 
-		// constructing the subproblem
-		feature_node **x = Malloc(feature_node *,l);
-		for(i=0;i<l;i++)
-			x[i] = prob->x[perm[i]];
+            model_->w = w_store.release();
+            return model_;
+        }
+        else
+        {
+            int nr_class;
+            std::unique_ptr<int[]> label{};
+            std::unique_ptr<int[]> start{};
+            std::unique_ptr<int[]> count{};
+            std::unique_ptr<int[]> perm{new int[l]};
 
-		int k;
-		problem sub_prob;
-		sub_prob.l = l;
-		sub_prob.n = n;
-		sub_prob.x = Malloc(feature_node *,sub_prob.l);
-		sub_prob.y = Malloc(double,sub_prob.l);
+            // group training data of the same class
+            group_classes(prob, &nr_class, label, start, count, perm.get());
 
-		for(k=0; k<sub_prob.l; k++)
-			sub_prob.x[k] = x[k];
+            model_->nr_class = nr_class;
 
-		auto const cleanup = [&] {
-            free(x);
-            free(label);
-            free(start);
-            free(count);
-            free(perm);
-            free(sub_prob.x);
-            free(sub_prob.y);
-            free(weighted_C);
-        };
+            // calculate weighted C
+            std::unique_ptr<double[]> weighted_C{new double[nr_class]};
+            for (i = 0; i < nr_class; i++)
+                weighted_C[i] = param->C;
+            for (i = 0; i < param->nr_weight; i++)
+            {
+                for (j = 0; j < nr_class; j++)
+                    if (param->weight_label[i] == label[j])
+                        break;
+                if (j == nr_class)
+                    fprintf(stderr, "WARNING: class label %d specified in weight is not found\n", param->weight_label[i]);
+                else
+                    weighted_C[j] *= param->weight[i];
+            }
 
-		// multi-class svm by Crammer and Singer
-		if(param->solver_type == MCSVM_CS)
-		{
-			model_->w=Malloc(double, n*nr_class);
-			for(i=0;i<nr_class;i++)
-				for(j=start[i];j<start[i]+count[i];j++)
-					sub_prob.y[j] = i;
-			Solver_MCSVM_CS Solver(&sub_prob, nr_class, weighted_C, param->eps);
-			Solver.Solve(model_->w);
-		}
-		else
-		{
-			if(nr_class == 2)
-			{
-				model_->w=Malloc(double, w_size);
+            // constructing the subproblem
+            std::unique_ptr<feature_node*[]> x{new feature_node*[l]};
+            for (i = 0; i < l; i++)
+                x[i] = prob->x[perm[i]];
 
-				int e0 = start[0]+count[0];
-				k=0;
-				for(; k<e0; k++)
-					sub_prob.y[k] = +1;
-				for(; k<sub_prob.l; k++)
-					sub_prob.y[k] = -1;
+            int k;
+            problem sub_prob;
+            sub_prob.l = l;
+            sub_prob.n = n;
+            std::unique_ptr<feature_node*[]> sub_prob_x_storage{new feature_node*[sub_prob.l]};
+            sub_prob.x = sub_prob_x_storage.get();
+            std::unique_ptr<double[]> sub_prob_y_storage{new double[sub_prob.l]};
+            sub_prob.y = sub_prob_y_storage.get();
 
-				if(param->init_sol != NULL)
-					for(i=0;i<w_size;i++)
-						model_->w[i] = param->init_sol[i];
-				else
-					for(i=0;i<w_size;i++)
-						model_->w[i] = 0;
+            for (k = 0; k < sub_prob.l; k++)
+                sub_prob.x[k] = x[k];
 
-				train_one(&sub_prob, param, model_->w, weighted_C[0], weighted_C[1]);
-			}
-			else
-			{
-			    threaded_vec_t threaded_w{w_size * nr_class};
-			    std::vector<std::tuple<std::future<void>, std::thread>> workers;
-                auto threads = min(liblinear_threads, static_cast<unsigned>(max(0, nr_class)));
-                workers.reserve(threads);
+            // multi-class svm by Crammer and Singer
+            if (param->solver_type == MCSVM_CS)
+            {
+                std::unique_ptr<double[]> w_storage{new double[n * nr_class]};
+                for (i = 0; i < nr_class; i++)
+                    for (j = start[i]; j < start[i] + count[i]; j++)
+                        sub_prob.y[j] = i;
+                Solver_MCSVM_CS Solver(&sub_prob, nr_class, weighted_C.get(), param->eps);
+                Solver.Solve(w_storage.get());
 
-			    std::atomic_size_t current_class{0};
-
-			    // Simple work stealer
-			    for (auto t = 0u; t < threads; ++t)
+                model_->w = w_storage.release();
+                model_->label = label.release();
+                return model_;
+            }
+            else
+            {
+                if (nr_class == 2)
                 {
-			        using std::promise;
-			        using std::thread;
+                    std::unique_ptr<double[]> w_storage{new double[w_size]};
 
-			        promise<void> p;
-			        auto f = p.get_future();
-			        thread t_{[&param, &threaded_w, &current_class, weighted_C, w_size, nr_class, l, count, start, sub_prob, p = std::move(p)]() mutable {
-			            try
-                        {
-                            std::vector<double> w(w_size), y(l);
-                            sub_prob.y = y.data();
-                            for (int i = current_class++; i < nr_class; i = current_class++)
+                    int e0 = start[0] + count[0];
+                    k = 0;
+                    for (; k < e0; k++)
+                        sub_prob.y[k] = +1;
+                    for (; k < sub_prob.l; k++)
+                        sub_prob.y[k] = -1;
+
+                    if (param->init_sol != NULL)
+                        for (i = 0; i < w_size; i++)
+                            w_storage[i] = param->init_sol[i];
+                    else
+                        for (i = 0; i < w_size; i++)
+                            w_storage[i] = 0;
+
+                    train_one(&sub_prob, param, w_storage.get(), weighted_C[0], weighted_C[1]);
+
+                    model_->label = label.release();
+                    model_->w = w_storage.release();
+                    return model_;
+                }
+                else
+                {
+                    threaded_vec_t threaded_w{w_size * nr_class};
+                    std::vector<std::tuple<std::future<void>, std::thread>> workers;
+                    auto threads = min(liblinear_threads, static_cast<unsigned>(max(0, nr_class)));
+                    workers.reserve(threads);
+
+                    std::atomic_size_t current_class{0};
+
+                    // Simple work stealer
+                    for (auto t = 0u; t < threads; ++t)
+                    {
+                        using std::promise;
+                        using std::thread;
+
+                        promise<void> p;
+                        auto f = p.get_future();
+                        thread t_{[&param, &threaded_w, &current_class, weighted_C = weighted_C.get(), w_size, nr_class, l, count = count.get(), start = start.get(), sub_prob, p = std::move(p)]() mutable {
+                            try
                             {
-                                int si = start[i];
-                                int ei = si + count[i];
+                                std::vector<double> w(w_size), y(l);
+                                sub_prob.y = y.data();
+                                for (int i = current_class++; i < nr_class; i = current_class++)
+                                {
+                                    int si = start[i];
+                                    int ei = si + count[i];
 
-                                int k = 0;
-                                for (; k < si; k++)
-                                    sub_prob.y[k] = -1;
-                                for (; k < ei; k++)
-                                    sub_prob.y[k] = +1;
-                                for (; k < sub_prob.l; k++)
-                                    sub_prob.y[k] = -1;
+                                    int k = 0;
+                                    for (; k < si; k++)
+                                        sub_prob.y[k] = -1;
+                                    for (; k < ei; k++)
+                                        sub_prob.y[k] = +1;
+                                    for (; k < sub_prob.l; k++)
+                                        sub_prob.y[k] = -1;
 
-                                if (param->init_sol != NULL)
+                                    if (param->init_sol != NULL)
+                                        for (int j = 0; j < w_size; j++)
+                                            w[j] = param->init_sol[j * nr_class + i];
+                                    else
+                                        for (int j = 0; j < w_size; j++)
+                                            w[j] = 0;
+
+                                    train_one(&sub_prob, param, w.data(), weighted_C[i], param->C);
+
                                     for (int j = 0; j < w_size; j++)
-                                        w[j] = param->init_sol[j * nr_class + i];
-                                else
-                                    for (int j = 0; j < w_size; j++)
-                                        w[j] = 0;
+                                        threaded_w[j * nr_class + i] = w[j];
+                                }
 
-                                train_one(&sub_prob, param, w.data(), weighted_C[i], param->C);
-
-                                for (int j = 0; j < w_size; j++)
-                                    threaded_w[j * nr_class + i] = w[j];
+                                p.set_value_at_thread_exit();
                             }
+                            catch (...)
+                            {
+                                p.set_exception(std::current_exception());
+                            }
+                        }};
 
-                            p.set_value_at_thread_exit();
-                        }
-			            catch (...)
-                        {
-			                p.set_exception(std::current_exception());
-                        }
-                    }};
+                        workers.emplace_back(std::move(f), std::move(t_));
+                    }
 
-			        workers.emplace_back(std::move(f), std::move(t_));
+                    auto join = [&workers] { std::for_each(begin(workers), end(workers), [](auto& t) { std::get<1>(t).join(); }); };
+
+                    try
+                    {
+                        std::for_each(begin(workers), end(workers), [](auto& t) { std::get<0>(t).get(); });
+                        join();
+                    }
+                    catch (...)
+                    {
+                        join();
+
+                        model_->w = nullptr;
+                        model_->label = nullptr;
+                        throw;
+                    }
+
+                    threaded_w.commit(model_->w);
+                    model_->label = label.release();
+                    return model_;
                 }
+            }
+        }
+    }
 
-			    auto join = [&workers] { std::for_each(begin(workers), end(workers), [](auto& t) { std::get<1>(t).join(); }); };
+    void find_parameters(const problem* prob, const parameter* param, int nr_fold, double start_C, double start_p, double* best_C, double* best_p,
+                         double* best_score, int(* callback)(long, void*), void* cbdata)
+    {
+        // prepare CV folds
+        int i;
+        int l = prob->l;
+        std::unique_ptr<int[]> perm{new int[l]};
+        std::unique_ptr<problem[]> subprob{new problem[nr_fold]};
 
-			    try
+        if (nr_fold > l)
+        {
+            nr_fold = l;
+            fprintf(stderr, "WARNING: # folds > # data. Will use # folds = # data instead (i.e., leave-one-out cross validation)\n");
+        }
+        std::unique_ptr<int[]> fold_start{new int[nr_fold + 1]};
+        for (i = 0; i < l; i++) perm[i] = i;
+        for (i = 0; i < l; i++)
+        {
+            int j = i + liblinear_random_func() % (l - i);
+            swap(perm[i], perm[j]);
+        }
+        for (i = 0; i <= nr_fold; i++)
+            fold_start[i] = i * l / nr_fold;
+
+        for (i = 0; i < nr_fold; i++)
+        {
+            subprob[i].x = nullptr;
+            subprob[i].y = nullptr;
+        }
+
+        struct free_subprob_guard_t {
+            problem* subprob;
+            int nr_fold;
+            ~free_subprob_guard_t() {
+                for (decltype(nr_fold) i = 0; i < nr_fold; i++)
                 {
-                    std::for_each(begin(workers), end(workers), [](auto& t) { std::get<0>(t).get(); });
-                    join();
+                    delete[] subprob[i].x;
+                    delete[] subprob[i].y;
+                    subprob[i].x = nullptr;
+                    subprob[i].y = nullptr;
                 }
-			    catch (...)
+            }
+        } free_subprob_guard{subprob.get(), nr_fold};
+
+        for (i = 0; i < nr_fold; i++)
+        {
+            int begin = fold_start[i];
+            int end = fold_start[i + 1];
+            int j, k;
+
+            subprob[i].bias = prob->bias;
+            subprob[i].n = prob->n;
+            subprob[i].l = l - (end - begin);
+            subprob[i].x = new feature_node*[subprob[i].l];
+            subprob[i].y = new double[subprob[i].l];
+
+            k = 0;
+            for (j = 0; j < begin; j++)
+            {
+                subprob[i].x[k] = prob->x[perm[j]];
+                subprob[i].y[k] = prob->y[perm[j]];
+                ++k;
+            }
+            for (j = end; j < l; j++)
+            {
+                subprob[i].x[k] = prob->x[perm[j]];
+                subprob[i].y[k] = prob->y[perm[j]];
+                ++k;
+            }
+
+        }
+
+        struct parameter param_tmp = *param;
+        *best_p = -1;
+        if (param->solver_type == L2R_LR || param->solver_type == L2R_L2LOSS_SVC)
+        {
+            if (start_C <= 0)
+                start_C = calc_start_C(prob, &param_tmp);
+            double max_C = 1024;
+            start_C = min(start_C, max_C);
+
+            find_parameter_C(prob, &param_tmp, start_C, max_C, best_C, best_score, fold_start.get(), perm.get(), subprob.get(), nr_fold, callback, cbdata);
+        }
+        else if (param->solver_type == L2R_L2LOSS_SVR)
+        {
+            double max_p = calc_max_p(prob, &param_tmp);
+            int num_p_steps = 20;
+            double max_C = 1048576;
+            *best_score = INF;
+
+            i = num_p_steps - 1;
+            if (start_p > 0)
+                i = min((int) (start_p / (max_p / num_p_steps)), i);
+            for (; i >= 0; i--)
+            {
+                param_tmp.p = i * max_p / num_p_steps;
+                double start_C_tmp;
+                if (start_C <= 0)
+                    start_C_tmp = calc_start_C(prob, &param_tmp);
+                else
+                    start_C_tmp = start_C;
+                start_C_tmp = min(start_C_tmp, max_C);
+                double best_C_tmp, best_score_tmp;
+
+                find_parameter_C(prob, &param_tmp, start_C_tmp, max_C, &best_C_tmp, &best_score_tmp, fold_start.get(), perm.get(), subprob.get(), nr_fold, callback, cbdata);
+
+                if (best_score_tmp < *best_score)
                 {
-			        join();
-
-                    cleanup();
-
-                    model_->w = nullptr;
-                    free_and_destroy_model(&model_);
-
-			        throw;
+                    *best_p = param_tmp.p;
+                    *best_C = best_C_tmp;
+                    *best_score = best_score_tmp;
                 }
+            }
+        }
+    }
 
-			    threaded_w.commit(model_->w);
-			}
-
-		}
-
-		cleanup();
-	}
-	return model_;
+    double predict(model const* mdl, feature_node const* x)
+    {
+        std::unique_ptr<double[]> dec_values{new double[mdl->nr_class]};
+        return c_interface::predict_values(mdl, x, dec_values.get());
+    }
 }
-
-void cross_validation(const problem *prob, const parameter *param, int nr_fold, double *target)
-{
-	int i;
-	int *fold_start;
-	int l = prob->l;
-	int *perm = Malloc(int,l);
-	if (nr_fold > l)
-	{
-		nr_fold = l;
-		fprintf(stderr,"WARNING: # folds > # data. Will use # folds = # data instead (i.e., leave-one-out cross validation)\n");
-	}
-	fold_start = Malloc(int,nr_fold+1);
-	for(i=0;i<l;i++) perm[i]=i;
-	for(i=0;i<l;i++)
-	{
-		int j = i+liblinear_random_func()%(l-i);
-		swap(perm[i],perm[j]);
-	}
-	for(i=0;i<=nr_fold;i++)
-		fold_start[i]=i*l/nr_fold;
-
-	for(i=0;i<nr_fold;i++)
-	{
-		int begin = fold_start[i];
-		int end = fold_start[i+1];
-		int j,k;
-		struct problem subprob;
-
-		subprob.bias = prob->bias;
-		subprob.n = prob->n;
-		subprob.l = l-(end-begin);
-		subprob.x = Malloc(struct feature_node*,subprob.l);
-		subprob.y = Malloc(double,subprob.l);
-
-		k=0;
-		for(j=0;j<begin;j++)
-		{
-			subprob.x[k] = prob->x[perm[j]];
-			subprob.y[k] = prob->y[perm[j]];
-			++k;
-		}
-		for(j=end;j<l;j++)
-		{
-			subprob.x[k] = prob->x[perm[j]];
-			subprob.y[k] = prob->y[perm[j]];
-			++k;
-		}
-		struct model *submodel = train(&subprob,param);
-		for(j=begin;j<end;j++)
-			target[perm[j]] = predict(submodel,prob->x[perm[j]]);
-		free_and_destroy_model(&submodel);
-		free(subprob.x);
-		free(subprob.y);
-	}
-	free(fold_start);
-	free(perm);
-}
-
 
 void find_parameters(const problem *prob, const parameter* param, int nr_fold, double start_C, double start_p, double* best_C, double* best_p, double* best_score,
                      int(*callback)(long, void*), void* cbdata)
 {
-	// prepare CV folds
+    try
+    {
+        liblinear::find_parameters(prob, param, nr_fold, start_C, start_p, best_C, best_p, best_score, callback, cbdata);
+        return;
+    } catch (std::exception const& ex)
+    {
+        info("exception in find_parameters: %s", ex.what());
+    } catch (...)
+    {
+        info("unknown exception in find_parameters");
+    }
 
-	int i;
-	int *fold_start;
-	int l = prob->l;
-	int *perm = Malloc(int, l);
-	struct problem *subprob = Malloc(problem,nr_fold);
-
-	if (nr_fold > l)
-	{
-		nr_fold = l;
-		fprintf(stderr,"WARNING: # folds > # data. Will use # folds = # data instead (i.e., leave-one-out cross validation)\n");
-	}
-	fold_start = Malloc(int,nr_fold+1);
-	for(i=0;i<l;i++) perm[i]=i;
-	for(i=0;i<l;i++)
-	{
-		int j = i+liblinear_random_func()%(l-i);
-		swap(perm[i],perm[j]);
-	}
-	for(i=0;i<=nr_fold;i++)
-		fold_start[i]=i*l/nr_fold;
-
-	for(i=0;i<nr_fold;i++)
-	{
-		int begin = fold_start[i];
-		int end = fold_start[i+1];
-		int j,k;
-
-		subprob[i].bias = prob->bias;
-		subprob[i].n = prob->n;
-		subprob[i].l = l-(end-begin);
-		subprob[i].x = Malloc(struct feature_node*,subprob[i].l);
-		subprob[i].y = Malloc(double,subprob[i].l);
-
-		k=0;
-		for(j=0;j<begin;j++)
-		{
-			subprob[i].x[k] = prob->x[perm[j]];
-			subprob[i].y[k] = prob->y[perm[j]];
-			++k;
-		}
-		for(j=end;j<l;j++)
-		{
-			subprob[i].x[k] = prob->x[perm[j]];
-			subprob[i].y[k] = prob->y[perm[j]];
-			++k;
-		}
-
-	}
-
-	struct parameter param_tmp = *param;
-	*best_p = -1;
-	if(param->solver_type == L2R_LR || param->solver_type == L2R_L2LOSS_SVC)
-	{
-		if(start_C <= 0)
-			start_C = calc_start_C(prob, &param_tmp);
-		double max_C = 1024;
-		start_C = min(start_C, max_C);
-
-		find_parameter_C(prob, &param_tmp, start_C, max_C, best_C, best_score, fold_start, perm, subprob, nr_fold, callback, cbdata);
-	}
-	else if(param->solver_type == L2R_L2LOSS_SVR)
-	{
-		double max_p = calc_max_p(prob, &param_tmp);
-		int num_p_steps = 20;
-		double max_C = 1048576;
-		*best_score = INF;
-
-		i = num_p_steps-1;
-		if(start_p > 0)
-			i = min((int)(start_p/(max_p/num_p_steps)), i);
-		for(; i >= 0; i--)
-		{
-			param_tmp.p = i*max_p/num_p_steps;
-			double start_C_tmp;
-			if(start_C <= 0)
-				start_C_tmp = calc_start_C(prob, &param_tmp);
-			else
-				start_C_tmp = start_C;
-			start_C_tmp = min(start_C_tmp, max_C);
-			double best_C_tmp, best_score_tmp;
-
-			find_parameter_C(prob, &param_tmp, start_C_tmp, max_C, &best_C_tmp, &best_score_tmp, fold_start, perm, subprob, nr_fold, callback, cbdata);
-
-			if(best_score_tmp < *best_score)
-			{
-				*best_p = param_tmp.p;
-				*best_C = best_C_tmp;
-				*best_score = best_score_tmp;
-			}
-		}
-	}
-
-	free(fold_start);
-	free(perm);
-	for(i=0; i<nr_fold; i++)
-	{
-		free(subprob[i].x);
-		free(subprob[i].y);
-	}
-	free(subprob);
+    *best_C = start_C;
+    *best_p = start_p;
+    *best_score = 0;
 }
 
 double predict_values(const struct model *model_, const struct feature_node *x, double *dec_values)
@@ -2963,10 +2915,17 @@ double predict_values(const struct model *model_, const struct feature_node *x, 
 
 double predict(const model *model_, const feature_node *x)
 {
-	double *dec_values = Malloc(double, model_->nr_class);
-	double label=predict_values(model_, x, dec_values);
-	free(dec_values);
-	return label;
+    try
+    {
+        return liblinear::predict(model_, x);
+    } catch (std::exception const& e)
+    {
+        info("exception in predict: %s", e.what());
+    } catch (...)
+    {
+        info("unknown exception in predict");
+    }
+    return (model_->nr_class > 0 && model_->label) ? model_->label[0] : 0;
 }
 
 double predict_probability(const struct model *model_, const struct feature_node *x, double* prob_estimates)
@@ -3030,6 +2989,11 @@ int save_model(const char *model_file_name, const struct model *model_)
 	if (old_locale)
 	{
 		old_locale = strdup(old_locale);
+		if (!old_locale)
+        {
+		    fclose(fp);
+		    return -2;
+        }
 	}
 	setlocale(LC_ALL, "C");
 
@@ -3089,119 +3053,143 @@ int save_model(const char *model_file_name, const struct model *model_)
 #define EXIT_LOAD_MODEL()\
 {\
 	setlocale(LC_ALL, old_locale);\
-	free(model_->label);\
-	free(model_);\
+	delete[] model_->label;\
 	free(old_locale);\
 	return NULL;\
 }
-struct model *load_model(const char *model_file_name)
+
+namespace liblinear {
+    model* load_model(const char* model_file_name)
+    {
+        FILE* fp = fopen(model_file_name, "r");
+        if (fp == NULL) return NULL;
+
+        int i;
+        int nr_feature;
+        int n;
+        int nr_class;
+        double bias;
+        model_ptr_t model_{new model};
+        parameter& param = model_->param;
+        // parameters for training only won't be assigned, but arrays are assigned as NULL for safety
+        param.nr_weight = 0;
+        param.weight_label = NULL;
+        param.weight = NULL;
+        param.init_sol = NULL;
+
+        model_->label = nullptr;
+        model_->w = nullptr;
+
+        char* old_locale = setlocale(LC_ALL, NULL);
+        if (old_locale)
+        {
+            old_locale = strdup(old_locale);
+            if (!old_locale)
+            {
+                fclose(fp);
+                return nullptr;
+            }
+        }
+        setlocale(LC_ALL, "C");
+
+        char cmd[81];
+        while (1)
+        {
+            FSCANF(fp, "%80s", cmd);
+            if (strcmp(cmd, "solver_type") == 0)
+            {
+                FSCANF(fp, "%80s", cmd);
+                int i;
+                for (i = 0; solver_type_table[i]; i++)
+                {
+                    if (strcmp(solver_type_table[i], cmd) == 0)
+                    {
+                        param.solver_type = i;
+                        break;
+                    }
+                }
+                if (solver_type_table[i] == NULL)
+                {
+                    fprintf(stderr, "unknown solver type.\n");
+                    EXIT_LOAD_MODEL()
+                }
+            }
+            else if (strcmp(cmd, "nr_class") == 0)
+            {
+                FSCANF(fp, "%d", &nr_class);
+                model_->nr_class = nr_class;
+            }
+            else if (strcmp(cmd, "nr_feature") == 0)
+            {
+                FSCANF(fp, "%d", &nr_feature);
+                model_->nr_feature = nr_feature;
+            }
+            else if (strcmp(cmd, "bias") == 0)
+            {
+                FSCANF(fp, "%lf", &bias);
+                model_->bias = bias;
+            }
+            else if (strcmp(cmd, "w") == 0)
+            {
+                break;
+            }
+            else if (strcmp(cmd, "label") == 0)
+            {
+                int nr_class = model_->nr_class;
+                model_->label = new int[nr_class];
+                for (int i = 0; i < nr_class; i++)
+                    FSCANF(fp, "%d", &model_->label[i]);
+            }
+            else
+            {
+                fprintf(stderr, "unknown text in model file: [%s]\n", cmd);
+                EXIT_LOAD_MODEL()
+            }
+        }
+
+        nr_feature = model_->nr_feature;
+        if (model_->bias >= 0)
+            n = nr_feature + 1;
+        else
+            n = nr_feature;
+        int w_size = n;
+        int nr_w;
+        if (nr_class == 2 && param.solver_type != MCSVM_CS)
+            nr_w = 1;
+        else
+            nr_w = nr_class;
+
+        model_->w = new double[w_size * nr_w];
+        for (i = 0; i < w_size; i++)
+        {
+            int j;
+            for (j = 0; j < nr_w; j++)
+                FSCANF(fp, "%lf ", &model_->w[i * nr_w + j]);
+        }
+
+        setlocale(LC_ALL, old_locale);
+        free(old_locale);
+
+        if (ferror(fp) != 0 || fclose(fp) != 0) return NULL;
+
+        return model_.release();
+    }
+}
+
+struct model* load_model(const char* model_file_name)
 {
-	FILE *fp = fopen(model_file_name,"r");
-	if(fp==NULL) return NULL;
+    try
+    {
+        return load_model(model_file_name);
+    } catch (std::exception const& e)
+    {
+        info("exception in load_model: %s", e.what());
+    } catch (...)
+    {
+        info("unknown exception in load_model");
+    }
 
-	int i;
-	int nr_feature;
-	int n;
-	int nr_class;
-	double bias;
-	model *model_ = Malloc(model,1);
-	parameter& param = model_->param;
-	// parameters for training only won't be assigned, but arrays are assigned as NULL for safety
-	param.nr_weight = 0;
-	param.weight_label = NULL;
-	param.weight = NULL;
-	param.init_sol = NULL;
-
-	model_->label = NULL;
-
-	char *old_locale = setlocale(LC_ALL, NULL);
-	if (old_locale)
-	{
-		old_locale = strdup(old_locale);
-	}
-	setlocale(LC_ALL, "C");
-
-	char cmd[81];
-	while(1)
-	{
-		FSCANF(fp,"%80s",cmd);
-		if(strcmp(cmd,"solver_type")==0)
-		{
-			FSCANF(fp,"%80s",cmd);
-			int i;
-			for(i=0;solver_type_table[i];i++)
-			{
-				if(strcmp(solver_type_table[i],cmd)==0)
-				{
-					param.solver_type=i;
-					break;
-				}
-			}
-			if(solver_type_table[i] == NULL)
-			{
-				fprintf(stderr,"unknown solver type.\n");
-				EXIT_LOAD_MODEL()
-			}
-		}
-		else if(strcmp(cmd,"nr_class")==0)
-		{
-			FSCANF(fp,"%d",&nr_class);
-			model_->nr_class=nr_class;
-		}
-		else if(strcmp(cmd,"nr_feature")==0)
-		{
-			FSCANF(fp,"%d",&nr_feature);
-			model_->nr_feature=nr_feature;
-		}
-		else if(strcmp(cmd,"bias")==0)
-		{
-			FSCANF(fp,"%lf",&bias);
-			model_->bias=bias;
-		}
-		else if(strcmp(cmd,"w")==0)
-		{
-			break;
-		}
-		else if(strcmp(cmd,"label")==0)
-		{
-			int nr_class = model_->nr_class;
-			model_->label = Malloc(int,nr_class);
-			for(int i=0;i<nr_class;i++)
-				FSCANF(fp,"%d",&model_->label[i]);
-		}
-		else
-		{
-			fprintf(stderr,"unknown text in model file: [%s]\n",cmd);
-			EXIT_LOAD_MODEL()
-		}
-	}
-
-	nr_feature=model_->nr_feature;
-	if(model_->bias>=0)
-		n=nr_feature+1;
-	else
-		n=nr_feature;
-	int w_size = n;
-	int nr_w;
-	if(nr_class==2 && param.solver_type != MCSVM_CS)
-		nr_w = 1;
-	else
-		nr_w = nr_class;
-
-	model_->w=Malloc(double, w_size*nr_w);
-	for(i=0; i<w_size; i++)
-	{
-		int j;
-		for(j=0; j<nr_w; j++)
-			FSCANF(fp, "%lf ", &model_->w[i*nr_w+j]);
-	}
-
-	setlocale(LC_ALL, old_locale);
-	free(old_locale);
-
-	if (ferror(fp) != 0 || fclose(fp) != 0) return NULL;
-
-	return model_;
+    return nullptr;
 }
 
 int get_nr_feature(const model *model_)
@@ -3270,10 +3258,8 @@ double get_decfun_bias(const struct model *model_, int label_idx)
 
 void free_model_content(struct model *model_ptr)
 {
-	if(model_ptr->w != NULL)
-		free(model_ptr->w);
-	if(model_ptr->label != NULL)
-		free(model_ptr->label);
+    delete[] model_ptr->w;
+    delete[] model_ptr->label;
 }
 
 void free_and_destroy_model(struct model **model_ptr_ptr)
@@ -3282,18 +3268,15 @@ void free_and_destroy_model(struct model **model_ptr_ptr)
 	if(model_ptr != NULL)
 	{
 		free_model_content(model_ptr);
-		free(model_ptr);
+		delete model_ptr;
 	}
 }
 
 void destroy_param(parameter* param)
 {
-	if(param->weight_label != NULL)
-		free(param->weight_label);
-	if(param->weight != NULL)
-		free(param->weight);
-	if(param->init_sol != NULL)
-		free(param->init_sol);
+    delete[] param->weight_label;
+    delete[] param->weight;
+    delete[] param->init_sol;
 }
 
 const char *check_parameter(const problem *prob, const parameter *param)

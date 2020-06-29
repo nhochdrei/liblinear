@@ -1,13 +1,14 @@
-#ifndef _LIBLINEAR_H
-#define _LIBLINEAR_H
+#ifndef LIBLINEAR_H
+#define LIBLINEAR_H
 
 #define LIBLINEAR_VERSION 230
 
 #ifdef __cplusplus
 #include <functional>
+#include <memory>
 #include <utility>
 extern "C" {
-#endif
+#endif // __cplus_plus
 
 extern int liblinear_version;
 extern unsigned liblinear_threads;
@@ -53,22 +54,9 @@ struct model
 };
 
 struct model* train(const struct problem *prob, const struct parameter *param);
-void cross_validation(const struct problem *prob, const struct parameter *param, int nr_fold, double *target);
 void find_parameters(const struct problem *prob, const struct parameter *param, int nr_fold, double start_C, double start_p, double *best_C, double *best_p, double *best_score, int (*callback)(long, void*), void* callbackData);
-#ifdef __cplusplus
-extern "C++"
-template<typename Callback>
-void find_parameters(const struct problem *prob, const struct parameter *param, int nr_fold, double start_C, double start_p, double *best_C, double *best_p, double *best_score, Callback&& callback)
-{
-    using ft = std::function<bool(long)>;
-    ft bound{std::forward<Callback>(callback)};
-    find_parameters(prob, param, nr_fold, start_C, start_p, best_C, best_p, best_score, [](long it, void* data) { return (*static_cast<ft*>(data))(it) ? 1 : 0; }, &bound);
-}
-#endif
-
+double predict(const model *model_, const feature_node *x);
 double predict_values(const struct model *model_, const struct feature_node *x, double* dec_values);
-double predict(const struct model *model_, const struct feature_node *x);
-double predict_probability(const struct model *model_, const struct feature_node *x, double* prob_estimates);
 
 int save_model(const char *model_file_name, const struct model *model_);
 struct model *load_model(const char *model_file_name);
@@ -91,7 +79,50 @@ void set_random_function(int (*random_func) (void));
 
 #ifdef __cplusplus
 }
+
+namespace liblinear {
+    namespace impl {
+        struct model_destroyer_t
+        {
+            void operator()(model* mdl) const noexcept
+            {
+                free_and_destroy_model(&mdl);
+            }
+        };
+    }
+    using model_ptr_t = std::unique_ptr<model, impl::model_destroyer_t>;
+
+    model_ptr_t train(const problem *prob, const parameter *param);
+    void find_parameters(const problem *prob, const parameter *param, int nr_fold, double start_C, double start_p, double *best_C, double *best_p, double *best_score, int (*callback)(long, void*), void* callbackData);
+    template<typename Callback>
+    void find_parameters(const problem *prob, const parameter *param, int nr_fold, double start_C, double start_p, double *best_C, double *best_p, double *best_score, Callback&& callback)
+    {
+        using ft = std::function<bool(long)>;
+        ft bound{std::forward<Callback>(callback)};
+        ::find_parameters(prob, param, nr_fold, start_C, start_p, best_C, best_p, best_score, [](long it, void* data) { return (*static_cast<ft*>(data))(it) ? 1 : 0; }, &bound);
+    }
+    double predict(const model *model_, const feature_node *x);
+    model *load_model(const char *model_file_name);
+
+    inline namespace c_interface {
+        using ::predict_values;
+        using ::get_nr_feature;
+        using ::get_nr_class;
+        using ::get_labels;
+        using ::get_decfun_coef;
+        using ::get_decfun_bias;
+        using ::save_model;
+        using ::free_model_content;
+        using ::free_and_destroy_model;
+        using ::destroy_param;
+        using ::check_parameter;
+        using ::check_probability_model;
+        using ::check_regression_model;
+        using ::set_print_string_function;
+        using ::set_random_function;
+    }
+}
 #endif
 
-#endif /* _LIBLINEAR_H */
+#endif /* LIBLINEAR_H */
 
